@@ -56,21 +56,6 @@ Parameters:
     Description: (Optional)
     Default: 'minecraft-server'
 
-  KeyPairName:
-    Type: String
-    Description: (Optional - An empty value disables this feature)
-    Default: ''
-
-  YourIPv4:
-    Type: String
-    Description: (Optional - An empty value disables this feature)
-    Default: ''
-
-  YourIPv6:
-    Type: String
-    Description: (Optional - An empty value disables this feature)
-    Default: ''
-
   HostedZoneId:
     Type: String
     Description: (Optional - An empty value disables this feature) If you have a hosted zone in Route 53 and wish to set a DNS record whenever your Minecraft instance starts, supply the hosted zone ID here.
@@ -83,7 +68,7 @@ Parameters:
 
   MinecraftImageTag:
     Type: String
-    Description: "Java version (Examples include latest, adopt13, openj9, etc) Refer to tag descriptions available here: https://github.com/itzg/docker-minecraft-server)"
+    Description: "Java version (Examples include latest, adopt13, openj9, etc) Refer to tag descriptions available here: https://github.com/itzg/docker-minecraft-server)" - Multi Architecture
     Default: 'latest'
 
   MinecraftTypeTag:
@@ -170,6 +155,10 @@ Parameters:
     Type: String
     Description: "Change the server's timezone. Use the canonical name of the format: Area/Location (e.g. America/New_York)"
 
+  PublicKey:
+    Type: String
+    Description: A public key to add to the instance(s)
+
 Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
@@ -209,12 +198,6 @@ Metadata:
         - LogGroupRetentionInDays
         - LogStreamPrefix
       - Label: 
-          default: Optional Remote Access (SSH) Configuration
-        Parameters:
-        - KeyPairName
-        - YourIPv4
-        - YourIPv6
-      - Label: 
           default: Optional DNS Configuration
         Parameters:
         - HostedZoneId
@@ -250,12 +233,6 @@ Metadata:
         default: "Number of days to retain CloudWatch logs"
       LogStreamPrefix:
         default: "Prefix for container log stream e.g. minecraft-server"
-      KeyPairName:
-        default: "If you wish to access the instance via SSH, select a Key Pair to use. https://console.aws.amazon.com/ec2/v2/home?#KeyPairs:sort=keyName"
-      YourIPv4:
-        default: "If you wish to access the instance via SSH and using IPv4, provide it."
-      YourIPv6:
-        default: "If you wish to access the instance via SSH and using IPv6, provide it."
       HostedZoneId:
         default: "If you have a hosted zone in Route 53 and wish to update a DNS record whenever your Minecraft instance starts, supply the hosted zone ID here."
       RecordName:
@@ -288,10 +265,7 @@ Conditions:
   LogGroupNameProvided: !Not [ !Equals [ !Ref LogGroupName, '' ] ]
   LogStreamPrefixProvided:  !Not [ !Equals [ !Ref LogStreamPrefix, '' ] ]
   KeyPairNameProvided: !Not [ !Equals [ !Ref KeyPairName, '' ] ]
-  IPv4AddressProvided: !Not [ !Equals [ !Ref YourIPv4, '' ] ]
-  IPv6AddressProvided: !Not [ !Equals [ !Ref YourIPv6, '' ] ]
   DnsConfigEnabled: !And [ !Not [ !Equals [ !Ref HostedZoneId, '' ] ], !Not [ !Equals [ !Ref RecordName, '' ] ] ]
-  SpotPriceProvided: !Not [ !Equals [ !Ref SpotPrice, '' ] ]
   MemoryProvided: !Not [ !Equals [ !Ref Memory, '' ] ]
   SeedProvided: !Not [ !Equals [ !Ref Seed, '' ] ]
   MaxPlayersProvided: !Not [ !Equals [ !Ref MaxPlayers, -1 ] ]
@@ -338,12 +312,6 @@ Resources:
       RouteTableId: !Ref RouteTable
       SubnetId: !Ref SubnetA
 
-  SubnetBRoute:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties: 
-      RouteTableId: !Ref RouteTable
-      SubnetId: !Ref SubnetB  
-
   SubnetB:
     Type: AWS::EC2::Subnet
     Properties:
@@ -353,6 +321,28 @@ Resources:
         Ref: 'AWS::Region'
       CidrBlock: !Select [ 1, !Cidr [ 10.100.0.0/26, 4, 4 ] ]
       VpcId: !Ref Vpc
+
+  SubnetBRoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: 
+      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref SubnetB  
+
+  SubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select
+      - 2
+      - !GetAZs 
+        Ref: 'AWS::Region'
+      CidrBlock: !Select [ 2, !Cidr [ 10.100.0.0/26, 4, 4 ] ]
+      VpcId: !Ref Vpc
+
+  SubnetCRoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: 
+      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref SubnetC  
 
   InternetGateway:
     Type: AWS::EC2::InternetGateway
@@ -382,7 +372,9 @@ Resources:
 
   Efs:
     Type: AWS::EFS::FileSystem
-    Properties: {}
+    Properties:
+      PerformanceMode: generalPurpose
+      ThroughputMode: bursting # elastic
 
   MountA:
     Type: AWS::EFS::MountTarget
@@ -400,6 +392,14 @@ Resources:
       - !Ref EfsSg
       SubnetId: !Ref SubnetB
 
+  MountC:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref Efs
+      SecurityGroups:
+      - !Ref EfsSg
+      SubnetId: !Ref SubnetC
+
   EfsSg:
     Type: AWS::EC2::SecurityGroup
     Properties: 
@@ -416,52 +416,51 @@ Resources:
   # INSTANCE CONFIG
   # ====================================================
 
+  KeyPair:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: !Sub "${AWS::StackName}-key-pair"
+      KeyType: rsa
+      PublicKeyMaterial: !Ref PublicKey
+
+
   Ec2Sg:
     Type: AWS::EC2::SecurityGroup
     Properties: 
       GroupName: !Sub "${AWS::StackName}-ec2"
       GroupDescription: !Sub "${AWS::StackName}-ec2"
       SecurityGroupIngress:
-      - !If
-        - IPv4AddressProvided 
-        - FromPort: 22
-          ToPort: 22
-          IpProtocol: tcp
-          CidrIp: !Sub "${YourIPv4}/32"
-        - !Ref 'AWS::NoValue'
-      - !If
-        - IPv6AddressProvided 
-        - FromPort: 22
-          ToPort: 22
-          IpProtocol: tcp
-          CidrIpv6: !Sub "${YourIPv6}/128"
-        - !Ref 'AWS::NoValue'
       - FromPort: 25565
         ToPort: 25565
         IpProtocol: tcp
         CidrIp: 0.0.0.0/0
       VpcId: !Ref Vpc
 
-  LaunchConfiguration:
-    Type: AWS::AutoScaling::LaunchConfiguration
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
     Properties:
-      AssociatePublicIpAddress: true
-      IamInstanceProfile: !Ref InstanceProfile
-      ImageId: !Ref ECSAMI
-      InstanceType: !Ref InstanceType
-      KeyName: 
-        !If [ KeyPairNameProvided, !Ref KeyPairName, !Ref 'AWS::NoValue' ]
-      SecurityGroups:
-      - !Ref Ec2Sg
-      SpotPrice: !If [ SpotPriceProvided, !Ref SpotPrice, !Ref 'AWS::NoValue' ]
-      UserData:
-        Fn::Base64: !Sub |
-          #!/bin/bash -xe
-          echo ECS_CLUSTER=${EcsCluster} >> /etc/ecs/ecs.config
-          yum install -y amazon-efs-utils
-          mkdir /opt/minecraft
-          mount -t efs ${Efs}:/ /opt/minecraft
-          chown 845:845 /opt/minecraft
+      LaunchTemplateName: test
+      LaunchTemplateData:
+        ImageId: ami-086b3de06dafe36c5
+        InstanceMarketOptions:
+          MarketType: spot
+          SpotOptions:
+            MaxPrice: !Ref SpotPrice # If you do not specify this parameter, you will pay the current Spot price.
+            InstanceInterruptionBehavior: terminate
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt InstanceProfile.Arn
+        KeyName: !Ref KeyPair
+        SecurityGroupIds:
+        - !Ref Ec2Sg
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+            echo ECS_CLUSTER=${EcsCluster} >> /etc/ecs/ecs.config
+            yum install -y amazon-efs-utils
+            mkdir /opt/minecraft
+            mount -t efs ${Efs}:/ /opt/minecraft
+            chown 845:845 /opt/minecraft
 
   AutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
@@ -471,13 +470,16 @@ Resources:
     Properties:
       AutoScalingGroupName: !Sub "${AWS::StackName}-asg"
       DesiredCapacity: !FindInMap [ ServerState, !Ref ServerState, DesiredCapacity ]
-      LaunchConfigurationName: !Ref LaunchConfiguration
-      NewInstancesProtectedFromScaleIn: true
+      LaunchTemplate:
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+        LaunchTemplateId: !Ref LaunchTemplate
+      NewInstancesProtectedFromScaleIn: false
       MaxSize: 1
       MinSize: 0
       VPCZoneIdentifier:
         - !Ref SubnetA
         - !Ref SubnetB
+        - !Ref SubnetC
     Metadata:
       LaunchEvent: !If [ DnsConfigEnabled, !GetAtt LaunchEvent.Arn, "" ]
 
@@ -557,7 +559,7 @@ Resources:
       NetworkMode: "bridge"
       ContainerDefinitions:      
         - Name: minecraft
-          MemoryReservation: 1024
+          MemoryReservation: 2048
           Image: !Sub "itzg/minecraft-server:${MinecraftImageTag}"
           EntryPoint: !If
               - EntryPointProvided
@@ -684,7 +686,7 @@ Resources:
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
       Policies:
-        - PolicyName: root
+        - PolicyName: ChangeDNSRecords
           PolicyDocument: 
             Version: "2012-10-17"
             Statement: 
@@ -763,6 +765,196 @@ Resources:
       FunctionName: !GetAtt SetDNSRecordLambda.Arn
       Principal: events.amazonaws.com
       SourceArn: !GetAtt LaunchEvent.Arn
+
+  # ====================================================
+  # Server Status Lambda
+  # ====================================================
+
+  # ====================================================
+  # SET DNS RECORD
+  # ====================================================
+
+  ServerStatusLambdaRole:
+    Type: AWS::IAM::Role
+    Condition: DnsConfigEnabled
+    Properties: 
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ASGPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - autoscaling:DescribeAutoScalingGroups
+                  - autoscaling:SetDesiredCapacity
+                  - autoscaling:TerminateInstanceInAutoScalingGroup
+                Resource: '*'
+
+  ServerStatusLambda:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3
+          import botocore
+          import json
+          import logging
+          import os
+
+          ASG_NAME = os.environ['ASG_NAME']
+
+          def lambda_handler(event, context):
+              group_name = ASG_NAME
+              asg_controller = AutoScalingGroupController(group_name)
+              if event['rawPath'] == '/on':
+                  return asg_controller.turn_on()
+              elif event['rawPath'] == '/off':
+                  return asg_controller.turn_off()
+              elif event['rawPath'] == '/status':
+                  return asg_controller.get_status()
+              else:
+                  return {
+                      "statusCode": 404,
+                      "body": json.dumps({
+                          "message": "Invalid URL",
+                      }),
+                      "isBase64Encoded": False
+                  }
+
+          class AutoScaler:
+              def __init__(self, group_name):
+                  self.client = boto3.client('autoscaling')
+                  self.ec2_client = boto3.client('ec2')
+                  self.group_name = group_name
+                  
+              def set_desired_capacity(self, capacity):
+                  try:
+                      response = self.client.set_desired_capacity(
+                          AutoScalingGroupName=self.group_name,
+                          DesiredCapacity=capacity,
+                          HonorCooldown=True
+                      )
+                  except botocore.exceptions.ClientError as e:
+                      logging.error(e)
+                      raise
+                  return response
+              
+              def describe_auto_scaling_group(self):
+                  try:
+                      response = self.client.describe_auto_scaling_groups(
+                          AutoScalingGroupNames=[self.group_name]
+                      )
+                  except botocore.exceptions.ClientError as e:
+                      raise # This should raise an error to the caller
+                  return response['AutoScalingGroups'][0]['DesiredCapacity']
+              
+              def get_status(self):
+                  # Check the current state of the Auto Scaling Group - i.e. desired capacity and any instance ID as well as its launch time
+                  try:
+                      response = self.client.describe_auto_scaling_groups(
+                          AutoScalingGroupNames=[self.group_name]
+                      )
+
+                      # Get the launch time of the instance
+                      try:
+                          instance_id = response['AutoScalingGroups'][0]['Instances'][0]['InstanceId']
+                          instance_response = self.ec2_client.describe_instances(
+                              InstanceIds=[instance_id]
+                          )
+                          launch_time = instance_response['Reservations'][0]['Instances'][0]['LaunchTime']
+                      except IndexError:
+                          launch_time = "No instances currently in the Auto Scaling Group"
+                          raise
+
+                  except botocore.exceptions.ClientError as e:
+                      raise
+
+                  # Return dictionary of the desired capacity and the instance IDs and launch times
+                  return {
+                      "desired_capacity": response['AutoScalingGroups'][0]['DesiredCapacity'],
+                      "instance_id": instance_id,
+                      "launch_time": launch_time
+                  }
+              
+          class AutoScalingGroupController:
+              def __init__(self, group_name):
+                  self.autoscaler = AutoScaler(group_name)
+                  
+              def turn_on(self):
+                  if self.autoscaler.describe_auto_scaling_group() == 1:
+                      return {
+                          "statusCode": 304,
+                          "body": json.dumps({
+                              "message": "Desired Capacity is already 1",
+                          }),
+                          "isBase64Encoded": False
+                      }
+                  else:
+                      self.autoscaler.set_desired_capacity(1)
+                      return {
+                          "statusCode": 200,
+                          "body": json.dumps({
+                              "message": "Desired Capacity set to 1",
+                          }),
+                          "isBase64Encoded": False
+                      }
+                  # The error handling is not implemented here as it is handled by the AutoScaler class
+                  
+              def turn_off(self):
+                  if self.autoscaler.describe_auto_scaling_group() == 0:
+                      return {
+                          "statusCode": 304,
+                          "body": json.dumps({
+                              "message": "Desired Capacity is already 0",
+                          }),
+                          "isBase64Encoded": False
+                      }
+                  else:
+                      self.autoscaler.set_desired_capacity(0)
+                      return {
+                          "statusCode": 200,
+                          "body": json.dumps({
+                              "message": "Desired Capacity set to 0",
+                          }),
+                          "isBase64Encoded": False
+                      }
+                  
+              def get_status(self):
+                  status = self.autoscaler.get_status()
+                  return {
+                      "statusCode": 200,
+                      "body": json.dumps({
+                          "message": status,
+                      }),
+                      "isBase64Encoded": False
+                  }
+      Description: Server Status Lambda Function
+      FunctionName: !Sub "${AWS::StackName}-server-status"
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role: !GetAtt ServerStatusLambdaRole.Arn
+      Runtime: python3.9
+      Timeout: 20
+      Environment:
+        Variables:
+          ASG_NAME: !Ref AutoScalingGroup
+
+  ServerStatusLambdaUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt ServerStatusLambda.Arn
+      AuthType: NONE # public
 
 Outputs:
   CheckInstanceIp:
