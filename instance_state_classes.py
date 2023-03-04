@@ -76,7 +76,7 @@ class AutoScaler:
         return {
             "desired_capacity": response['AutoScalingGroups'][0]['DesiredCapacity'],
             "instance_id": instance_id,
-            "launch_time": launch_time
+            "launch_time": str(launch_time)
         }
     
 class AutoScalingGroupController:
@@ -86,7 +86,7 @@ class AutoScalingGroupController:
     def turn_on(self):
         if self.autoscaler.describe_auto_scaling_group() == 1:
             return {
-                "statusCode": 304,
+                "statusCode": 200,
                 "body": json.dumps({
                     "message": "Desired Capacity is already 1",
                 }),
@@ -106,7 +106,7 @@ class AutoScalingGroupController:
     def turn_off(self):
         if self.autoscaler.describe_auto_scaling_group() == 0:
             return {
-                "statusCode": 304,
+                "statusCode": 200,
                 "body": json.dumps({
                     "message": "Desired Capacity is already 0",
                 }),
@@ -126,8 +126,6 @@ class AutoScalingGroupController:
         status = self.autoscaler.get_status()
         return {
             "statusCode": 200,
-            "body": json.dumps({
-                "message": status,
-            }),
+            "body": json.dumps(status),
             "isBase64Encoded": False
         }
