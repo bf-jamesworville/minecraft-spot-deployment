@@ -1,11 +1,19 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: Minecraft Spot Price Server via Docker / ECS
 Parameters:
+  LambdaUrlDomain:
+    Description: The domain to use for the Lambda Function URL
+    Type: String
 
   ECSAMI:
     Description: AWS ECS AMI ID
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
-    Default: /aws/service/ecs/optimized-ami/amazon-linux-2/recommended/image_id
+    Default: /aws/service/ecs/optimized-ami/amazon-linux-2/kernel-5.10/arm64/recommended/image_id
+    # /aws/service/ecs/optimized-ami/amazon-linux-2/recommended/image_id - AMD64
+
+  LambdaUrlCertificateArn:
+    Description: The ARN of the certificate to use for the Lambda Function URL
+    Type: String
 
   ServerState:
     Type: String
@@ -447,6 +455,8 @@ Resources:
     Properties:
       LaunchTemplateName: !Sub "${AWS::StackName}-launch-template"
       LaunchTemplateData:
+        CreditSpecification:
+          CpuCredits: unlimited
         ImageId: !Ref ECSAMI
         InstanceMarketOptions:
           MarketType: spot
@@ -460,6 +470,13 @@ Resources:
         KeyName: !Ref KeyPair
         SecurityGroupIds:
         - !Ref Ec2Sg
+        # Replace root volume with a smaller one
+        BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            DeleteOnTermination: true
+            VolumeSize: 30
+            VolumeType: gp3
         UserData:
           Fn::Base64: !Sub |
             #!/bin/bash -xe
@@ -586,7 +603,7 @@ Resources:
           HealthCheck:
             Command: ["CMD-SHELL", "mc-health"]
             Interval: 5
-            Retries: 20
+            Retries: 10
             StartPeriod: 60
             Timeout: 15
           LogConfiguration:
@@ -813,6 +830,10 @@ Resources:
                   - autoscaling:SetDesiredCapacity
                   - autoscaling:TerminateInstanceInAutoScalingGroup
                   - ec2:DescribeInstances
+                  - ecs:ListServices
+                  - ecs:ListTasks
+                  - ecs:DescribeServices
+                  - ecs:DescribeTasks
                 Resource: '*'
 
   LambdaUrlPublicPermission:
@@ -831,10 +852,10 @@ Resources:
           import boto3
           import botocore
           import json
-          import logging
           import os
 
           ASG_NAME = os.environ['ASG_NAME']
+          ECS_CLUSTER_NAME = os.environ['ECS_CLUSTER_NAME']
 
           def lambda_handler(event, context):
               group_name = ASG_NAME
@@ -858,6 +879,7 @@ Resources:
               def __init__(self, group_name):
                   self.client = boto3.client('autoscaling')
                   self.ec2_client = boto3.client('ec2')
+                  self.ecs_client = boto3.client('ecs')
                   self.group_name = group_name
                   
               def set_desired_capacity(self, capacity):
@@ -867,9 +889,8 @@ Resources:
                           DesiredCapacity=capacity,
                           HonorCooldown=True
                       )
-                  except botocore.exceptions.ClientError as e:
-                      logging.error(e)
-                      raise
+                  except self.client.Client.exceptions.ScalingActivityInProgressFault as e:
+                      return e
                   return response
               
               def describe_auto_scaling_group(self):
@@ -877,44 +898,81 @@ Resources:
                       response = self.client.describe_auto_scaling_groups(
                           AutoScalingGroupNames=[self.group_name]
                       )
+
+                      desired_capacity = response['AutoScalingGroups'][0]['DesiredCapacity']
+                      return desired_capacity
+
                   except botocore.exceptions.ClientError as e:
-                      raise # This should raise an error to the caller
-                  return response['AutoScalingGroups'][0]['DesiredCapacity']
-              
-              def get_status(self):
-                  # Check the current state of the Auto Scaling Group - i.e. desired capacity and any instance ID as well as its launch time
+                      return e
+                  
+              def instance_running(self):
+                  # First determine that there is an instance in the Auto Scaling Group
                   try:
                       response = self.client.describe_auto_scaling_groups(
                           AutoScalingGroupNames=[self.group_name]
                       )
-
-                      # Get the launch time of the instance
-                      try:
-                          instance_id = response['AutoScalingGroups'][0]['Instances'][0]['InstanceId']
-                          instance_response = self.ec2_client.describe_instances(
-                              InstanceIds=[instance_id]
-                          )
-                          launch_time = instance_response['Reservations'][0]['Instances'][0]['LaunchTime']
-                      except IndexError:
-                          launch_time = "No instances currently in the Auto Scaling Group"
-                          raise
-
+                      if len(response['AutoScalingGroups'][0]['Instances']) == 0:
+                          return False
+                      else:
+                          return True
                   except botocore.exceptions.ClientError as e:
-                      raise
+                      return str(e)
+                  
+              def get_status_by_task_definition(self):
+                  # First determine the instance is running
+                  if self.instance_running():
+                      # Get the status of the task running on the ECS cluster
+                      try:
+                          list_tasks_response = self.ecs_client.list_tasks(
+                              cluster=ECS_CLUSTER_NAME,
+                              desiredStatus='RUNNING',
+                              launchType='EC2'
+                          )
 
-                  # Return dictionary of the desired capacity and the instance IDs and launch times
-                  return {
-                      "desired_capacity": response['AutoScalingGroups'][0]['DesiredCapacity'],
-                      "instance_id": instance_id,
-                      "launch_time": str(launch_time)
-                  }
-              
+                          # As there is only one task running on the cluster, we can get the task definition from the first item in the list
+                          task_definition_arn = list_tasks_response['taskArns'][0]
+
+                          # Get the health status of the task
+                          try:
+                              describe_tasks_response = self.ecs_client.describe_tasks(
+                                  cluster=ECS_CLUSTER_NAME,
+                                  tasks=[task_definition_arn]
+                              )
+                              # First determine the lifecycle state of the task
+                              task_lifecycle_state = describe_tasks_response['tasks'][0]['lastStatus']
+
+                              # If the task is not running, then return the current status
+                              if task_lifecycle_state != 'RUNNING':
+                                  return "The server is not running. Current status: " + task_lifecycle_state
+                              
+                              # If the task is running, then get the health status of the container
+                              else:
+                                  container_health_status = describe_tasks_response['tasks'][0]['containers'][0]['healthStatus']
+                                  return "The server is running. Current status: " + container_health_status
+                              
+                          except Exception as e:
+                              return "Something went wrong:" + e
+
+                      except Exception as e:
+                          return "Something went wrong:" + e
+                  else:
+                      return "The server is not currently running."
+
           class AutoScalingGroupController:
               def __init__(self, group_name):
                   self.autoscaler = AutoScaler(group_name)
                   
               def turn_on(self):
-                  if self.autoscaler.describe_auto_scaling_group() == 1:
+                  auto_scaling_group_capacity = self.autoscaler.describe_auto_scaling_group()
+                  if isinstance(auto_scaling_group_capacity, botocore.exceptions.ClientError):
+                      return {
+                          "statusCode": 500,
+                          "body": json.dumps({
+                              "message": "Error: " + str(auto_scaling_group_capacity),
+                          }),
+                          "isBase64Encoded": False
+                      }
+                  elif auto_scaling_group_capacity == 1:
                       return {
                           "statusCode": 200,
                           "body": json.dumps({
@@ -923,18 +981,35 @@ Resources:
                           "isBase64Encoded": False
                       }
                   else:
-                      self.autoscaler.set_desired_capacity(1)
+                      amended_capacity = self.autoscaler.set_desired_capacity(1)
+                      if isinstance(amended_capacity, Exception):
+                          return {
+                              "statusCode": 400,
+                              "body": json.dumps({
+                                  "message": "Error: Scaling already in progress",
+                              }),
+                              "isBase64Encoded": False
+                          }
+                      else:
+                          return {
+                              "statusCode": 200,
+                              "body": json.dumps({
+                                  "message": "Desired Capacity set to 1",
+                              }),
+                              "isBase64Encoded": False
+                          }
+                  
+              def turn_off(self):
+                  auto_scaling_group_capacity = self.autoscaler.describe_auto_scaling_group()
+                  if isinstance(auto_scaling_group_capacity, botocore.exceptions.ClientError):
                       return {
-                          "statusCode": 200,
+                          "statusCode": 500,
                           "body": json.dumps({
-                              "message": "Desired Capacity set to 1",
+                              "message": "Error: " + str(auto_scaling_group_capacity),
                           }),
                           "isBase64Encoded": False
                       }
-                  # The error handling is not implemented here as it is handled by the AutoScaler class
-                  
-              def turn_off(self):
-                  if self.autoscaler.describe_auto_scaling_group() == 0:
+                  elif auto_scaling_group_capacity == 0:
                       return {
                           "statusCode": 200,
                           "body": json.dumps({
@@ -943,22 +1018,51 @@ Resources:
                           "isBase64Encoded": False
                       }
                   else:
-                      self.autoscaler.set_desired_capacity(0)
+                      amended_capacity = self.autoscaler.set_desired_capacity(0)
+                      if isinstance(amended_capacity, Exception):
+                          return {
+                              "statusCode": 400,
+                              "body": json.dumps({
+                                  "message": "Error: Scaling already in progress",
+                              }),
+                              "isBase64Encoded": False
+                          }
+                      else:
+                          return {
+                              "statusCode": 200,
+                              "body": json.dumps({
+                                  "message": "Desired Capacity set to 0",
+                              }),
+                              "isBase64Encoded": False
+                          }        
+              # def get_status(self):
+              #     status = self.autoscaler.get_status()
+              #     return {
+              #         "statusCode": 200,
+              #         "body": json.dumps(status),
+              #         "isBase64Encoded": False
+              #     }
+
+              def get_status(self):
+                  status = self.autoscaler.get_status_by_task_definition()
+                  # If the status returns an error, then return the error
+                  if isinstance(status, Exception):
+                      return {
+                          "statusCode": 500,
+                          "body": {
+                              "message": str(status),
+                          },
+                          "isBase64Encoded": False
+                      }
+                  # Otherwise return the status
+                  else:
                       return {
                           "statusCode": 200,
                           "body": json.dumps({
-                              "message": "Desired Capacity set to 0",
+                              "message": status,
                           }),
                           "isBase64Encoded": False
                       }
-                  
-              def get_status(self):
-                  status = self.autoscaler.get_status()
-                  return {
-                      "statusCode": 200,
-                      "body": json.dumps(status),
-                      "isBase64Encoded": False
-                  }
 
       Description: Server Status Lambda Function
       FunctionName: !Sub "${AWS::StackName}-server-status"
@@ -977,7 +1081,39 @@ Resources:
       TargetFunctionArn: !GetAtt ServerStatusLambda.Arn
       AuthType: NONE # public
 
+  LambdaUrlCloudfront:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: "CloudFront Distribution for proxying to Lambda"
+        Aliases: [!Ref LambdaUrlDomain]
+        Origins:
+          - DomainName: !Select [2, !Split ["/", !GetAtt ServerStatusLambdaUrl.FunctionUrl]] # Remove https:// from URL.
+            Id: LambdaFunctionURL
+            CustomOriginConfig:
+              OriginSSLProtocols:
+                - TLSv1.2
+              OriginProtocolPolicy: https-only
+        Enabled: True
+        DefaultCacheBehavior:
+          AllowedMethods: ['GET', 'HEAD', 'OPTIONS']
+          CachedMethods: ['GET', 'HEAD']
+          CachePolicyId: '4135ea2d-6df8-44a3-9df3-4b5a84be39ad' # This is the ID of the CachingDisabled Policy
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac # This is the ID of the AllViewer (Except Host) Policy
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03 # This is the ID of the ManagedSecurityHeaders Policy
+          Compress: True
+          TargetOriginId: LambdaFunctionURL
+          ViewerProtocolPolicy: 'redirect-to-https'
+        HttpVersion: http2
+        PriceClass: PriceClass_100 # Europe and North America (lowest possible)
+        ViewerCertificate:
+          AcmCertificateArn: !Ref LambdaUrlCertificateArn # The ARN of a certificate provisioned in us-east-1 - the only region compatible with CloudFront
+          MinimumProtocolVersion: "TLSv1.2_2021"
+          SslSupportMethod: sni-only
 Outputs:
   CheckInstanceIp:
     Description: To find your Minecraft instance IP address, visit the following link. Click on the instance to find its Public IP address.
     Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/ec2/v2/home?region=${AWS::Region}#Instances:tag:aws:autoscaling:groupName=${AutoScalingGroup};sort=tag:Name"
+  Domain:
+    Description: The domain name of the Minecraft server
+    Value: !Select [2, !Split ["/", !GetAtt ServerStatusLambdaUrl.FunctionUrl]] # Remove https:// from URL.
